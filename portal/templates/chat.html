@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111827">
+  <title>0x7E — Node {{ node_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="chat-page">
+  <header class="topbar">
+    <div><p class="eyebrow">OFFLINE RADIO CHAT</p><h1>0x7E <span>— Node {{ node_name }}</span></h1></div>
+    <form id="name-form" class="name-form">
+      <label for="name-input">You</label>
+      <input id="name-input" maxlength="32" value="{{ session['username'] }}" aria-label="Display name">
+      <button class="secondary" type="submit">Change name</button>
+    </form>
+  </header>
+  <main class="chat-shell">
+    <section id="messages" class="messages" aria-live="polite" aria-label="Message history">
+      <p class="empty">Waiting for messages…</p>
+    </section>
+    <form id="send-form" class="compose">
+      <label for="message-input">Message</label>
+      <div class="compose-row">
+        <input id="message-input" maxlength="300" placeholder="@01 Need assistance… or @all Testing" autocomplete="off" required>
+        <button id="send-button" type="submit">Send</button>
+      </div>
+      <p id="status" class="status" role="status">Start with a destination such as @01 or @all.</p>
+    </form>
+  </main>
+  <script src="{{ url_for('static', filename='chat.js') }}" defer></script>
+</body>
+</html>

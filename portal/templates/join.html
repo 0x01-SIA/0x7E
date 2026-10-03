@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111827">
+  <title>0x7E — Node {{ node_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="join-card">
+    <p class="eyebrow">OFFLINE RADIO CHAT</p>
+    <h1>0x7E <span>— Node {{ node_name }}</span></h1>
+    <p class="muted">Choose a display name to enter the local node chat.</p>
+    <form action="{{ url_for('join') }}" method="post">
+      <label for="username">Display name</label>
+      <input id="username" name="username" maxlength="32" autocomplete="nickname" required autofocus>
+      {% if error %}<p class="error">{{ error }}</p>{% endif %}
+      <button type="submit">Enter chat</button>
+    </form>
+    <p class="footnote">Messages travel over the local 0x7E radio network.</p>
+  </main>
+</body>
+</html>

@@ -1,32 +1,17 @@
 #!/usr/bin/env python3
 
-import configparser
 from collections import OrderedDict
-import socket
-import spidev
 import threading
 import time
-from pathlib import Path
+from urllib.parse import quote, unquote
+from node_config import load_node_config, load_secrets
 
 
 # ============================================================
 # Paths / configuration
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-HOSTNAME = socket.gethostname().split(".")[0]
-
-NODE_CONFIG = BASE_DIR / "config" / f"{HOSTNAME}.conf"
-SECRETS_CONFIG = BASE_DIR / "config" / "secrets.conf"
-
-
-if not NODE_CONFIG.exists():
-    raise RuntimeError(
-        f"No config found for hostname '{HOSTNAME}': {NODE_CONFIG}"
-    )
-
-config = configparser.ConfigParser()
-config.read(NODE_CONFIG)
+config = load_node_config()
 
 NODE_NAME = config["NODE"]["name"]
 NODE_ID = config["NODE"]["id"]
@@ -40,17 +25,8 @@ SPI_SPEED = config.getint("RADIO", "spi_speed", fallback=500000)
 # Secret
 # ============================================================
 
-global_secret = None
-
-if SECRETS_CONFIG.exists():
-    secrets = configparser.ConfigParser()
-    secrets.read(SECRETS_CONFIG)
-
-    global_secret = secrets.get(
-        "SECURITY",
-        "global_secret",
-        fallback=None,
-    )
+secrets = load_secrets()
+global_secret = secrets.get("SECURITY", "global_secret", fallback=None)
 
 
 # ============================================================
@@ -74,10 +50,7 @@ CMD_FLUSH_TX = 0x72
 # SPI
 # ============================================================
 
-spi = spidev.SpiDev()
-spi.open(SPI_BUS, SPI_DEVICE)
-spi.mode = 0
-spi.max_speed_hz = SPI_SPEED
+spi = None
 
 #
 # VERY IMPORTANT:
@@ -94,6 +67,56 @@ protocol_lock = threading.Lock()
 next_message_id = 1
 pending_messages = {}
 recent_messages = OrderedDict()
+message_listeners = set()
+radio_started = False
+radio_start_lock = threading.Lock()
+
+
+def add_message_listener(listener):
+    """Subscribe to newly received messages; returns an unsubscribe function."""
+    with protocol_lock:
+        message_listeners.add(listener)
+
+    def unsubscribe():
+        with protocol_lock:
+            message_listeners.discard(listener)
+
+    return unsubscribe
+
+
+def _notify_message(message):
+    with protocol_lock:
+        listeners = tuple(message_listeners)
+    for listener in listeners:
+        try:
+            listener(message)
+        except Exception as exc:
+            print(f"[message listener error] {exc}")
+
+
+def start_radio():
+    """Initialize SPI and start the shared radio receive loop once."""
+    global spi, radio_started
+    with radio_start_lock:
+        if radio_started:
+            return
+        import spidev
+
+        device = spidev.SpiDev()
+        device.open(SPI_BUS, SPI_DEVICE)
+        device.mode = 0
+        device.max_speed_hz = SPI_SPEED
+        spi = device
+        try:
+            configure_radio()
+        except Exception:
+            try:
+                device.close()
+            finally:
+                spi = None
+            raise
+        threading.Thread(target=receive_loop, daemon=True, name="radio-rx").start()
+        radio_started = True
 
 
 # ============================================================
@@ -349,8 +372,19 @@ def parse_packet(packet):
     }
 
 
+def encode_chat_payload(sender, body):
+    return f"~u~{quote(sender, safe='')}~{body}"
+
+
+def decode_chat_payload(payload):
+    if payload.startswith("~u~") and "~" in payload[3:]:
+        encoded_sender, body = payload[3:].split("~", 1)
+        return unquote(encoded_sender) or "Radio user", body
+    return "Radio user", payload
+
+
 def send_ack(destination, message_id):
-    packet = build_packet(NODE_NAME, destination, message_id, "ACK")
+    packet = build_packet(NODE_ID, destination, message_id, "ACK")
     if transmit_payload(packet.encode("utf-8")):
         print(f"TX ACK #{message_id} -> {destination}")
 
@@ -365,7 +399,7 @@ def handle_packet(packet_text):
     message_id = parsed["message_id"]
     packet_type = parsed["type"]
 
-    if src == NODE_NAME or dst not in (NODE_NAME, "ALL"):
+    if src == NODE_ID or dst not in (NODE_ID, "ALL"):
         return
 
     if packet_type == "ACK":
@@ -385,32 +419,60 @@ def handle_packet(packet_text):
                 recent_messages.popitem(last=False)
 
     if not duplicate:
+        sender, body = decode_chat_payload(parsed["payload"])
         print()
-        print(f"RX {src} #{message_id}: {parsed['payload']}")
+        print(f"RX {src} #{message_id}: {body}")
         print("> ", end="", flush=True)
+        _notify_message({
+            "sender": sender,
+            "origin_node": src,
+            "destination": dst,
+            "body": body,
+            "message_id": message_id,
+        })
 
     # A duplicate is still acknowledged so the sender can stop retrying.
     send_ack(src, message_id)
 
 
-def send_message(text):
+def send_message(text, destination="ALL", sender="Console"):
     global next_message_id
+
+    if destination != "ALL" and not destination:
+        return False
+
+    wire_body = encode_chat_payload(sender, text)
+    packet = build_packet(NODE_ID, destination, "0", "MSG", wire_body)
+    payload = packet.encode("utf-8")
+    if len(payload) > FRAME_SIZE - 1:
+        return False
 
     with protocol_lock:
         message_id = str(next_message_id)
         next_message_id += 1
         pending_messages[message_id] = {
-            "destination": "ALL",
+            "destination": destination,
             "payload": text,
             "acks": set(),
         }
 
-    packet = build_packet(NODE_NAME, "ALL", message_id, "MSG", text)
-    if transmit_payload(packet.encode("utf-8")):
-        print(f"TX #{message_id} -> ALL: {text}")
+    wire_body = encode_chat_payload(sender, text)
+    packet = build_packet(NODE_ID, destination, message_id, "MSG", wire_body)
+    payload = packet.encode("utf-8")
+    if transmit_payload(payload):
+        print(f"TX #{message_id} -> {destination}: {text}")
+        _notify_message({
+            "sender": sender,
+            "origin_node": NODE_ID,
+            "destination": destination,
+            "body": text,
+            "message_id": message_id,
+        })
+        return True
     else:
         with protocol_lock:
             pending_messages.pop(message_id, None)
+        return False
 
 
 # ============================================================
@@ -418,8 +480,6 @@ def send_message(text):
 # ============================================================
 
 def receive_loop():
-
-    enter_rx()
 
     while True:
 
@@ -493,7 +553,6 @@ def main():
     print("======================================")
     print(f"Node:      {NODE_NAME}")
     print(f"Node ID:   {NODE_ID}")
-    print(f"Hostname:  {HOSTNAME}")
     print(
         f"SPI:       "
         f"/dev/spidev{SPI_BUS}.{SPI_DEVICE}"
@@ -505,14 +564,7 @@ def main():
     print("======================================")
     print()
 
-    configure_radio()
-
-    rx_thread = threading.Thread(
-        target=receive_loop,
-        daemon=True,
-    )
-
-    rx_thread.start()
+    start_radio()
 
     print("Type message and press ENTER.")
     print()
@@ -550,7 +602,8 @@ def main():
         except Exception:
             pass
 
-        spi.close()
+        if spi is not None:
+            spi.close()
 
 
 if __name__ == "__main__":
