@@ -1,0 +1,7 @@
+secrets.conf
+
+__pycache__/
+*.pyc
+*.pyo
+
+.DS_Store
