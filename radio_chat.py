@@ -16,7 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 HOSTNAME = socket.gethostname().split(".")[0]
 
 NODE_CONFIG = BASE_DIR / "config" / f"{HOSTNAME}.conf"
-SECRETS_CONFIG = BASE_DIR / "secrets.conf"
+SECRETS_CONFIG = BASE_DIR / "config" / "secrets.conf"
 
 
 if not NODE_CONFIG.exists():
@@ -35,17 +35,25 @@ SPI_DEVICE = config.getint("RADIO", "spi_device", fallback=0)
 SPI_SPEED = config.getint("RADIO", "spi_speed", fallback=500000)
 
 
-# Secret is intentionally NOT stored in Git.
+# ============================================================
+# Secret
+# ============================================================
+
 global_secret = None
 
 if SECRETS_CONFIG.exists():
     secrets = configparser.ConfigParser()
     secrets.read(SECRETS_CONFIG)
-    global_secret = secrets.get("SECURITY", "global_secret", fallback=None)
+
+    global_secret = secrets.get(
+        "SECURITY",
+        "global_secret",
+        fallback=None,
+    )
 
 
 # ============================================================
-# S2-LP
+# S2-LP constants
 # ============================================================
 
 FRAME_SIZE = 64
@@ -59,13 +67,29 @@ CMD_FLUSH_RX = 0x71
 CMD_FLUSH_TX = 0x72
 
 
+# ============================================================
+# SPI
+# ============================================================
+
 spi = spidev.SpiDev()
 spi.open(SPI_BUS, SPI_DEVICE)
 spi.mode = 0
 spi.max_speed_hz = SPI_SPEED
 
+#
+# VERY IMPORTANT:
+#
+# Only one thread may manipulate the radio at a time.
+#
+# TX involves several commands which must execute as one
+# uninterrupted sequence.
+#
 spi_lock = threading.Lock()
 
+
+# ============================================================
+# Low-level SPI helpers
+# ============================================================
 
 def cmd(code):
     with spi_lock:
@@ -75,6 +99,7 @@ def cmd(code):
 def read_reg(addr):
     with spi_lock:
         rx = spi.xfer2([0x01, addr, 0x00])
+
     return rx[2]
 
 
@@ -90,9 +115,46 @@ def write_fifo(data):
 
 def read_fifo(length):
     with spi_lock:
-        rx = spi.xfer2([0x01, FIFO] + [0x00] * length)
+        rx = spi.xfer2(
+            [0x01, FIFO] + [0x00] * length
+        )
 
     return bytes(rx[2:])
+
+
+# ============================================================
+# RX state management
+# ============================================================
+
+def enter_rx():
+    """
+    Force the radio into a known RX state.
+
+    RX/TX -> SABORT -> READY
+                     -> flush RX
+                     -> RX
+    """
+
+    with spi_lock:
+
+        #
+        # Abort whatever state the radio is currently in.
+        #
+        spi.xfer2([0x80, CMD_SABORT])
+        time.sleep(0.01)
+
+        #
+        # Remove anything stale from RX FIFO.
+        #
+        spi.xfer2([0x80, CMD_FLUSH_RX])
+        time.sleep(0.005)
+
+        #
+        # Start receiver.
+        #
+        spi.xfer2([0x80, CMD_RX])
+
+    time.sleep(0.01)
 
 
 # ============================================================
@@ -118,7 +180,7 @@ def configure_radio():
     write_reg(0x0A, 0xB7)
 
     #
-    # Modulation settings used by our working PoC
+    # Modulation settings
     #
     write_reg(0x0C, 0x83)
     write_reg(0x0D, 0x2B)
@@ -144,15 +206,20 @@ def configure_radio():
     write_reg(0x31, 0x00)
     write_reg(0x32, FRAME_SIZE)
 
-    cmd(CMD_SABORT)
-    time.sleep(0.05)
+    #
+    # Start from a clean state.
+    #
+    with spi_lock:
 
-    cmd(CMD_FLUSH_RX)
-    cmd(CMD_FLUSH_TX)
+        spi.xfer2([0x80, CMD_SABORT])
+        time.sleep(0.02)
 
-    cmd(CMD_READY)
+        spi.xfer2([0x80, CMD_FLUSH_RX])
+        spi.xfer2([0x80, CMD_FLUSH_TX])
 
-    time.sleep(0.05)
+        time.sleep(0.01)
+
+    enter_rx()
 
     print(f"[{NODE_NAME}] Radio ready")
 
@@ -166,37 +233,88 @@ def send_message(text):
     payload = text.encode("utf-8")
 
     if len(payload) > FRAME_SIZE - 1:
-        print(f"Message too long. Maximum: {FRAME_SIZE - 1} bytes")
+        print(
+            f"Message too long. "
+            f"Maximum: {FRAME_SIZE - 1} bytes"
+        )
         return
 
     #
-    # Frame format:
+    # Frame:
     #
-    # byte 0    = message length
-    # byte 1..  = UTF-8 payload
-    # remainder = zero padding
+    # byte 0      = payload length
+    # byte 1..N   = UTF-8 payload
+    # remainder   = zero padding
     #
 
     frame = bytes([len(payload)]) + payload
 
-    frame += bytes(FRAME_SIZE - len(frame))
+    frame += bytes(
+        FRAME_SIZE - len(frame)
+    )
 
-    cmd(CMD_SABORT)
-    cmd(CMD_READY)
+    #
+    # IMPORTANT:
+    #
+    # Lock the entire radio state transition.
+    #
+    # Otherwise the RX thread may issue an SPI command
+    # halfway through TX and leave the S2-LP in an
+    # undefined/unwanted state.
+    #
+
+    with spi_lock:
+
+        #
+        # RX -> READY
+        #
+        spi.xfer2([0x80, CMD_SABORT])
+        time.sleep(0.01)
+
+        #
+        # Clear old TX data.
+        #
+        spi.xfer2([0x80, CMD_FLUSH_TX])
+        time.sleep(0.005)
+
+        #
+        # Load frame into TX FIFO.
+        #
+        spi.xfer2(
+            [0x00, FIFO] + list(frame)
+        )
+
+        #
+        # Start transmission.
+        #
+        spi.xfer2([0x80, CMD_TX])
+
+        #
+        # Allow transmission to complete.
+        #
+        # Later we should replace this with proper
+        # TX_DATA_SENT interrupt/status handling.
+        #
+        time.sleep(0.12)
+
+        #
+        # TX -> READY
+        #
+        spi.xfer2([0x80, CMD_SABORT])
+        time.sleep(0.01)
+
+        #
+        # Clean RX FIFO before listening again.
+        #
+        spi.xfer2([0x80, CMD_FLUSH_RX])
+        time.sleep(0.005)
+
+        #
+        # Return immediately to RX.
+        #
+        spi.xfer2([0x80, CMD_RX])
 
     time.sleep(0.01)
-
-    cmd(CMD_FLUSH_TX)
-
-    write_fifo(frame)
-
-    cmd(CMD_TX)
-
-    time.sleep(0.08)
-
-    cmd(CMD_READY)
-    cmd(CMD_FLUSH_RX)
-    cmd(CMD_RX)
 
 
 # ============================================================
@@ -205,17 +323,15 @@ def send_message(text):
 
 def receive_loop():
 
-    cmd(CMD_SABORT)
-    cmd(CMD_READY)
-    cmd(CMD_FLUSH_RX)
-    cmd(CMD_RX)
+    enter_rx()
 
     while True:
 
         try:
 
             #
-            # FIFO status registers used in our working test.
+            # Number of bytes currently available
+            # in RX FIFO.
             #
             fifo_elements = read_reg(0x90)
 
@@ -227,35 +343,63 @@ def receive_loop():
 
                 if 0 < length <= FRAME_SIZE - 1:
 
-                    payload = frame[1:1 + length]
+                    payload = frame[
+                        1:1 + length
+                    ]
 
                     try:
-                        text = payload.decode("utf-8")
+
+                        text = payload.decode(
+                            "utf-8"
+                        )
 
                         print()
                         print(f"<< {text}")
-                        print("> ", end="", flush=True)
+                        print(
+                            "> ",
+                            end="",
+                            flush=True,
+                        )
 
                     except UnicodeDecodeError:
-                        pass
 
-                cmd(CMD_FLUSH_RX)
-                cmd(CMD_RX)
+                        print()
+                        print(
+                            "[RX] Invalid UTF-8 packet"
+                        )
+                        print(
+                            "> ",
+                            end="",
+                            flush=True,
+                        )
+
+                #
+                # Explicitly reset RX after every packet.
+                #
+                # Do NOT assume the S2-LP automatically
+                # remains in a usable RX state.
+                #
+                enter_rx()
 
             time.sleep(0.02)
 
         except Exception as exc:
 
-            print(f"\nRX error: {exc}")
+            print()
+            print(f"[RX error] {exc}")
 
+            #
+            # Try to recover the radio automatically.
+            #
             try:
-                cmd(CMD_SABORT)
-                cmd(CMD_READY)
-                cmd(CMD_FLUSH_RX)
-                cmd(CMD_RX)
+                enter_rx()
 
-            except Exception:
-                pass
+            except Exception as recovery_error:
+
+                print(
+                    f"[RX recovery error] "
+                    f"{recovery_error}"
+                )
 
             time.sleep(1)
 
@@ -273,9 +417,12 @@ def main():
     print(f"Node:      {NODE_NAME}")
     print(f"Node ID:   {NODE_ID}")
     print(f"Hostname:  {HOSTNAME}")
-    print(f"SPI:       /dev/spidev{SPI_BUS}.{SPI_DEVICE}")
     print(
-        f"Encryption secret: "
+        f"SPI:       "
+        f"/dev/spidev{SPI_BUS}.{SPI_DEVICE}"
+    )
+    print(
+        "Encryption secret: "
         f"{'loaded' if global_secret else 'NOT configured'}"
     )
     print("======================================")
@@ -293,9 +440,10 @@ def main():
     print("Type message and press ENTER.")
     print()
 
-    while True:
+    try:
 
-        try:
+        while True:
+
             text = input("> ").strip()
 
             if not text:
@@ -303,14 +451,29 @@ def main():
 
             send_message(text)
 
-        except KeyboardInterrupt:
-            print("\nStopping...")
-            break
+    except KeyboardInterrupt:
 
-        except EOFError:
-            break
+        print()
+        print("Stopping...")
 
-    spi.close()
+    except EOFError:
+
+        pass
+
+    finally:
+
+        #
+        # Leave radio in a known state before closing SPI.
+        #
+        try:
+            with spi_lock:
+                spi.xfer2(
+                    [0x80, CMD_SABORT]
+                )
+        except Exception:
+            pass
+
+        spi.close()
 
 
 if __name__ == "__main__":
