@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import configparser
+from collections import OrderedDict
 import socket
 import spidev
 import threading
@@ -58,6 +59,8 @@ if SECRETS_CONFIG.exists():
 
 FRAME_SIZE = 64
 FIFO = 0xFF
+PROTOCOL_MAGIC = "0x7E"
+RECENT_MESSAGE_LIMIT = 256
 
 CMD_TX = 0x60
 CMD_RX = 0x61
@@ -85,6 +88,12 @@ spi.max_speed_hz = SPI_SPEED
 # uninterrupted sequence.
 #
 spi_lock = threading.Lock()
+
+# Protocol state is shared by the console sender and RX thread.
+protocol_lock = threading.Lock()
+next_message_id = 1
+pending_messages = {}
+recent_messages = OrderedDict()
 
 
 # ============================================================
@@ -228,16 +237,14 @@ def configure_radio():
 # TX
 # ============================================================
 
-def send_message(text):
-
-    payload = text.encode("utf-8")
+def transmit_payload(payload):
 
     if len(payload) > FRAME_SIZE - 1:
         print(
-            f"Message too long. "
+            f"Packet too long. "
             f"Maximum: {FRAME_SIZE - 1} bytes"
         )
-        return
+        return False
 
     #
     # Frame:
@@ -316,6 +323,95 @@ def send_message(text):
 
     time.sleep(0.01)
 
+    return True
+
+
+def build_packet(src, dst, message_id, packet_type, payload=""):
+    return f"{PROTOCOL_MAGIC}|{src}|{dst}|{message_id}|{packet_type}|{payload}"
+
+
+def parse_packet(packet):
+    fields = packet.split("|", 5)
+    if len(fields) != 6:
+        return None
+
+    magic, src, dst, message_id, packet_type, payload = fields
+    if (magic != PROTOCOL_MAGIC or not src or not dst or not message_id
+            or packet_type not in ("MSG", "ACK")):
+        return None
+
+    return {
+        "src": src,
+        "dst": dst,
+        "message_id": message_id,
+        "type": packet_type,
+        "payload": payload,
+    }
+
+
+def send_ack(destination, message_id):
+    packet = build_packet(NODE_NAME, destination, message_id, "ACK")
+    if transmit_payload(packet.encode("utf-8")):
+        print(f"TX ACK #{message_id} -> {destination}")
+
+
+def handle_packet(packet_text):
+    parsed = parse_packet(packet_text)
+    if parsed is None:
+        return
+
+    src = parsed["src"]
+    dst = parsed["dst"]
+    message_id = parsed["message_id"]
+    packet_type = parsed["type"]
+
+    if src == NODE_NAME or dst not in (NODE_NAME, "ALL"):
+        return
+
+    if packet_type == "ACK":
+        with protocol_lock:
+            pending = pending_messages.get(message_id)
+            if pending is not None:
+                pending["acks"].add(src)
+        print(f"ACK #{message_id} <- {src}")
+        return
+
+    key = (src, message_id)
+    with protocol_lock:
+        duplicate = key in recent_messages
+        if not duplicate:
+            recent_messages[key] = None
+            if len(recent_messages) > RECENT_MESSAGE_LIMIT:
+                recent_messages.popitem(last=False)
+
+    if not duplicate:
+        print()
+        print(f"RX {src} #{message_id}: {parsed['payload']}")
+        print("> ", end="", flush=True)
+
+    # A duplicate is still acknowledged so the sender can stop retrying.
+    send_ack(src, message_id)
+
+
+def send_message(text):
+    global next_message_id
+
+    with protocol_lock:
+        message_id = str(next_message_id)
+        next_message_id += 1
+        pending_messages[message_id] = {
+            "destination": "ALL",
+            "payload": text,
+            "acks": set(),
+        }
+
+    packet = build_packet(NODE_NAME, "ALL", message_id, "MSG", text)
+    if transmit_payload(packet.encode("utf-8")):
+        print(f"TX #{message_id} -> ALL: {text}")
+    else:
+        with protocol_lock:
+            pending_messages.pop(message_id, None)
+
 
 # ============================================================
 # RX
@@ -348,30 +444,11 @@ def receive_loop():
                     ]
 
                     try:
-
-                        text = payload.decode(
-                            "utf-8"
-                        )
-
-                        print()
-                        print(f"<< {text}")
-                        print(
-                            "> ",
-                            end="",
-                            flush=True,
-                        )
-
+                        packet_text = payload.decode("utf-8")
+                        handle_packet(packet_text)
                     except UnicodeDecodeError:
-
-                        print()
-                        print(
-                            "[RX] Invalid UTF-8 packet"
-                        )
-                        print(
-                            "> ",
-                            end="",
-                            flush=True,
-                        )
+                        # Ignore radio data that is not a valid protocol packet.
+                        pass
 
                 #
                 # Explicitly reset RX after every packet.
